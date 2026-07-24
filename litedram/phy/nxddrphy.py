@@ -53,11 +53,11 @@ class BitSlip(Module):
 # Nexus DDR PHY Write BitSlip ----------------------------------------------------------------------
 
 class _NexusDDRPHYWriteBitSlip(ConstBitSlip):
-    def __init__(self, dw):
-        assert (dw % 2) == 0
+    def __init__(self, dw, nphases):
+        assert (dw % nphases) == 0
         ConstBitSlip.__init__(self,
             dw       = dw,
-            slp      = dw//2,
+            slp      = 0 if nphases == 4 else dw//nphases,
             cycles   = 1,
             register = False,
         )
@@ -65,7 +65,7 @@ class _NexusDDRPHYWriteBitSlip(ConstBitSlip):
 # Lattice Nexus DDR PHY Initialization --------------------------------------------------------------
 
 class NexusDDRPHYInit(Module):
-    def __init__(self):
+    def __init__(self, nphases=2):
         self.pause = Signal()
         self.stop  = Signal()
         self.delay = Signal(9)
@@ -89,7 +89,7 @@ class NexusDDRPHYInit(Module):
         delay = Signal(9)
         self.specials += Instance("DDRDLL",
             i_RST       = ResetSignal("init"),
-            i_CLKIN     = ClockSignal("sys2x"),
+            i_CLKIN     = ClockSignal(f"sys{nphases}x"),
             i_UDDCNTL_N = ~update,
             i_FREEZE    = freeze,
             o_CODE      = delay,
@@ -142,22 +142,23 @@ class NexusDDRPHY(Module, AutoCSR):
         cwl          = None,
         cmd_delay    = 0,
         clk_polarity = 0,
+        nphases      = 2,
         dm_remapping = None):
         assert isinstance(cmd_delay, int) and cmd_delay < 128
         pads        = PHYPadsCombiner(pads)
         memtype     = "DDR3"
-        tck         = 2/(2*2*sys_clk_freq)
+        tck         = 2/(2*nphases*sys_clk_freq)
         addressbits = len(pads.a)
         bankbits    = len(pads.ba)
         nranks      = 1 if not hasattr(pads, "cs_n") else len(pads.cs_n)
         databits    = len(pads.dq)
-        nphases     = 2 # TODO: Nexus has 8:1 IO primitives so 4 is also possible
+        assert nphases in (2, 4)
         if not dm_remapping:
             dm_remapping = {}
         assert databits%8 == 0
 
         # Init -------------------------------------------------------------------------------------
-        self.submodules.init = NexusDDRPHYInit()
+        self.submodules.init = NexusDDRPHYInit(nphases=nphases)
 
         # Parameters -------------------------------------------------------------------------------
         cl              = get_default_cl( memtype, tck) if cl  is None else cl
@@ -187,22 +188,22 @@ class NexusDDRPHY(Module, AutoCSR):
             phytype       = "NexusDDRPHY",
             memtype       = memtype,
             databits      = databits,
-            dfi_databits  = 4*databits,
+            dfi_databits  = (8//nphases)*databits,
             nranks        = nranks,
             nphases       = nphases,
             rdphase       = rdphase,
             wrphase       = wrphase,
             cl            = cl,
             cwl           = cwl,
-            read_latency  = cl_sys_latency + 9,
+            read_latency  = cl_sys_latency + 9 if nphases == 2 else cl_sys_latency + 7,
             write_latency = cwl_sys_latency - 1,
             read_leveling = True,
-            bitslips      = 4,
+            bitslips      = nphases*2,
             delays        = 16,
         )
 
         # DFI Interface ----------------------------------------------------------------------------
-        self.dfi = dfi = Interface(addressbits, bankbits, nranks, 4*databits, nphases)
+        self.dfi = dfi = Interface(addressbits, bankbits, nranks, (8//nphases)*databits, nphases)
 
         # # #
 
@@ -213,14 +214,14 @@ class NexusDDRPHY(Module, AutoCSR):
             pads.sel_group(pads_group)
 
             # Clock --------------------------------------------------------------------------------
-            clk_pattern = {0: 0b1010, 1: 0b0101}[clk_polarity]
+            clk_pattern = {0: 0b10101010, 1: 0b01010101}[clk_polarity]
             for i in range(len(pads.clk_p)):
                 pad_oddrx2f = Signal()
-                self.specials += Instance("ODDRX2",
+                self.specials += Instance(f"ODDRX{nphases}",
                     i_RST  = ResetSignal("sys"),
                     i_SCLK = ClockSignal("sys"),
-                    i_ECLK = ClockSignal("sys2x"),
-                    **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(4)},
+                    i_ECLK = ClockSignal(f"sys{nphases}x"),
+                    **{f"i_D{n}": (clk_pattern >> n) & 0b1 for n in range(2*nphases)},
                     o_Q    = pads.clk_p[i]
                 )
                 # Delay not supported on pseudo-differential output
@@ -245,17 +246,26 @@ class NexusDDRPHY(Module, AutoCSR):
                         raise ValueError(f"DRAM pad {pad_name} required but not found in pads.")
                     continue
                 for i in range(len(pad)):
-                    pad_oddrx2f = Signal()
-                    self.specials += Instance("ODDRX2",
-                        i_RST  = ResetSignal("sys"),
-                        i_SCLK = ClockSignal("sys"),
-                        i_ECLK = ClockSignal("sys2x"),
-                        **{f"i_D{n}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(4)},
-                        o_Q    = pad_oddrx2f
-                    )
+                    pad_oddrx = Signal()
+                    if nphases == 4:
+                        self.specials += Instance(f"OSHX4",
+                            i_RST  = ResetSignal("sys"),
+                            i_SCLK = ClockSignal("sys"),
+                            i_ECLK = ClockSignal(f"sys{nphases}x"),
+                            **{f"i_D{n}": getattr(dfi.phases[n], dfi_name)[i] for n in range(nphases)},
+                            o_Q    = pad_oddrx
+                        )
+                    else:
+                        self.specials += Instance(f"ODDRX{nphases}",
+                            i_RST  = ResetSignal("sys"),
+                            i_SCLK = ClockSignal("sys"),
+                            i_ECLK = ClockSignal(f"sys{nphases}x"),
+                            **{f"i_D{n}": getattr(dfi.phases[n//2], dfi_name)[i] for n in range(2*nphases)},
+                            o_Q    = pad_oddrx
+                        )
                     self.specials += Instance("DELAYB",
                         p_DEL_VALUE = str(cmd_delay),
-                        i_A         = pad_oddrx2f,
+                        i_A         = pad_oddrx,
                         o_Z         = pad[i]
                     )
 
@@ -292,7 +302,7 @@ class NexusDDRPHY(Module, AutoCSR):
                 p_MT_EN_WRITE_LEVELING = "ENABLED",
                 p_READ_ENABLE          = "ENABLED",
                 p_RX_CENTERED          = "ENABLED",
-                p_MODX                 = "MDDRX2",
+                p_MODX                 = f"MDDRX{nphases}",
                 p_UPDATE_QU            = "UP1_AND_UP0_SAME",
                 p_WRITE_ENABLE         = "ENABLED",
 
@@ -300,7 +310,7 @@ class NexusDDRPHY(Module, AutoCSR):
                 i_RST                  = ResetSignal("sys"),
                 i_RSTSMCNT             = ResetSignal("sys"),
                 i_SCLK                 = ClockSignal("sys"),
-                i_ECLKIN               = ClockSignal("sys2x"),
+                i_ECLKIN               = ClockSignal(f"sys{nphases}x"),
                 i_SELCLK               = 0,
                 i_DLLCODE              = self.init.delay,
                 i_PAUSE                = self.init.pause | self._dly_sel.storage[i],
@@ -340,35 +350,48 @@ class NexusDDRPHY(Module, AutoCSR):
             # DQS ----------------------------------------------------------------------------------
             dqs               = Signal()
             dqs_oe_n          = Signal()
-            dqs_o_data        = Signal(4)
-            dqs_oe_n_data     = Signal(2)
-            dqs_o_bitslip     = _NexusDDRPHYWriteBitSlip(4)
-            dqs_oe_n_bitslip  = _NexusDDRPHYWriteBitSlip(2)
+            dqs_o_data        = Signal(2*nphases)
+            dqs_oe_n_data     = Signal(nphases)
+            dqs_o_bitslip     = _NexusDDRPHYWriteBitSlip(2*nphases, nphases=nphases)
+            dqs_oe_n_bitslip  = _NexusDDRPHYWriteBitSlip(nphases, nphases=nphases)
             self.submodules += dqs_o_bitslip, dqs_oe_n_bitslip
+            if nphases == 4:
+                self.comb += [
+                    dqs_o_data.eq(Cat(0, dqs_oe, 0, dqs_oe, 0, dqs_oe, 0, dqs_oe | dqs_preamble)),
+                    dqs_oe_n_data.eq(Cat(
+                        ~(dqs_oe | dqs_postamble),
+                        ~(dqs_oe),
+                        ~(dqs_oe),
+                        ~(dqs_oe | dqs_preamble),
+                    ))
+                ]
+            else:
+                self.comb += [
+                    dqs_o_data.eq(Cat(0, dqs_oe, 0, dqs_oe | dqs_preamble)),
+                    dqs_oe_n_data.eq(Cat(
+                        ~(dqs_oe | dqs_postamble),
+                        ~(dqs_oe | dqs_preamble),
+                    ))
+                ]
             self.comb += [
-                dqs_o_data.eq(Cat(0, dqs_oe, 0, dqs_oe | dqs_preamble)),
-                dqs_oe_n_data.eq(Cat(
-                    ~(dqs_oe | dqs_postamble),
-                    ~(dqs_oe | dqs_preamble),
-                )),
                 dqs_o_bitslip.i.eq(dqs_o_data),
                 dqs_oe_n_bitslip.i.eq(dqs_oe_n_data),
             ]
             self.specials += [
-                Instance("ODDRX2DQS",
+                Instance(f"ODDRX{nphases}DQS",
                     i_RST  = ResetSignal("sys"),
                     i_SCLK = ClockSignal("sys"),
-                    i_ECLK = ClockSignal("sys2x"),
+                    i_ECLK = ClockSignal(f"sys{nphases}x"),
                     i_DQSW = dqsw,
-                    **{f"i_D{n}": dqs_o_bitslip.o[n] for n in range(4)},
+                    **{f"i_D{n}": dqs_o_bitslip.o[n] for n in range(2*nphases)},
                     o_Q    = dqs
                 ),
-                Instance("TSHX2DQS",
+                Instance(f"TSHX{nphases}DQS",
                     i_RST  = ResetSignal("sys"),
                     i_SCLK = ClockSignal("sys"),
-                    i_ECLK = ClockSignal("sys2x"),
+                    i_ECLK = ClockSignal(f"sys{nphases}x"),
                     i_DQSW = dqsw,
-                    **{f"i_T{n}": dqs_oe_n_bitslip.o[n] for n in range(2)},
+                    **{f"i_T{n}": dqs_oe_n_bitslip.o[n] for n in range(nphases)},
                     o_Q    = dqs_oe_n
                 ),
                 Tristate(pads.dqs_p[i], dqs, ~dqs_oe_n, dqs_i)
@@ -378,22 +401,25 @@ class NexusDDRPHY(Module, AutoCSR):
             dm_o_data       = Signal(8)
             dm_o_data_d     = Signal(8)
             dm_o_data_muxed = Signal(4)
-            dm_o_bitslip    = _NexusDDRPHYWriteBitSlip(4)
+            dm_o_bitslip    = _NexusDDRPHYWriteBitSlip(2*nphases, nphases=nphases)
             self.submodules += dm_o_bitslip
-            for n in range(8):
-                self.comb += dm_o_data[n].eq(dfi.phases[n//4].wrdata_mask[n%4*databits//8+dm_remapping.get(i, i)])
-            self.comb += dm_o_bitslip.i.eq(dm_o_data_muxed)
-            self.sync += dm_o_data_d.eq(dm_o_data)
-            dm_bl8_cases = {}
-            dm_bl8_cases[0] = dm_o_data_muxed.eq(dm_o_data[:4])
-            dm_bl8_cases[1] = dm_o_data_muxed.eq(dm_o_data_d[4:])
-            self.sync += Case(bl8_chunk, dm_bl8_cases)
-            self.specials += Instance("ODDRX2DQ",
+            if nphases == 4:
+                self.sync += dm_o_bitslip.i.eq(Cat(*[dfi.phases[n//2].wrdata_mask[n%2*databits//8+dm_remapping.get(i, i)] for n in range(8)]))
+            else:
+                for n in range(8):
+                    self.comb += dm_o_data[n].eq(dfi.phases[n//4].wrdata_mask[n%4*databits//8+dm_remapping.get(i, i)])
+                self.comb += dm_o_bitslip.i.eq(dm_o_data_muxed)
+                self.sync += dm_o_data_d.eq(dm_o_data)
+                dm_bl8_cases = {}
+                dm_bl8_cases[0] = dm_o_data_muxed.eq(dm_o_data[:4])
+                dm_bl8_cases[1] = dm_o_data_muxed.eq(dm_o_data_d[4:])
+                self.sync += Case(bl8_chunk, dm_bl8_cases)
+            self.specials += Instance(f"ODDRX{nphases}DQ",
                 i_RST     = ResetSignal("sys"),
                 i_SCLK    = ClockSignal("sys"),
-                i_ECLK    = ClockSignal("sys2x"),
+                i_ECLK    = ClockSignal(f"sys{nphases}x"),
                 i_DQSW270 = dqsw270,
-                **{f"i_D{n}": dm_o_bitslip.o[n] for n in range(4)},
+                **{f"i_D{n}": dm_o_bitslip.o[n] for n in range(2*nphases)},
                 o_Q       = pads.dm[i]
             )
 
@@ -408,35 +434,49 @@ class NexusDDRPHY(Module, AutoCSR):
                 dq_o_data_d     = Signal(8)
                 dq_o_data_muxed = Signal(4)
                 dq_oe_n_data    = Signal(2)
-                dq_o_bitslip    = _NexusDDRPHYWriteBitSlip(4)
-                dq_oe_n_bitslip = _NexusDDRPHYWriteBitSlip(2)
+                dq_o_bitslip    = _NexusDDRPHYWriteBitSlip(2*nphases, nphases=nphases)
+                dq_oe_n_bitslip = _NexusDDRPHYWriteBitSlip(nphases, nphases=nphases)
                 self.submodules += dq_o_bitslip, dq_oe_n_bitslip
-                for n in range(8):
-                    self.comb += dq_o_data[n].eq(dfi.phases[n//4].wrdata[n%4*databits+j])
-                self.comb += [
-                    dq_oe_n_data.eq(Cat(
-                        ~(dq_oe | dqs_postamble),
-                        ~(dq_oe | dqs_preamble),
-                    )),
-                    dq_o_bitslip.i.eq(dq_o_data_muxed),
-                    dq_oe_n_bitslip.i.eq(dq_oe_n_data),
-                ]
-                self.sync += dq_o_data_d.eq(dq_o_data)
-                dq_bl8_cases = {}
-                dq_bl8_cases[0] = dq_o_data_muxed.eq(dq_o_data[:4])
-                dq_bl8_cases[1] = dq_o_data_muxed.eq(dq_o_data_d[4:])
-                self.sync += Case(bl8_chunk, dq_bl8_cases)
+                if nphases == 4:
+                    for n in range(8):
+                        self.sync += dq_o_data[n].eq(dfi.phases[n//2].wrdata[n%2*databits+j])
+                    self.comb += [
+                        dq_oe_n_data.eq(Cat(
+                            ~(dq_oe | dqs_postamble),
+                            ~dq_oe,
+                            ~dq_oe,
+                            ~(dq_oe | dqs_preamble),
+                        )),
+                        dq_o_bitslip.i.eq(dq_o_data),
+                        dq_oe_n_bitslip.i.eq(dq_oe_n_data),
+                    ]
+                else:
+                    for n in range(8):
+                        self.comb += dq_o_data[n].eq(dfi.phases[n//4].wrdata[n%4*databits+j])
+                    self.comb += [
+                        dq_oe_n_data.eq(Cat(
+                            ~(dq_oe | dqs_postamble),
+                            ~(dq_oe | dqs_preamble),
+                        )),
+                        dq_o_bitslip.i.eq(dq_o_data_muxed),
+                        dq_oe_n_bitslip.i.eq(dq_oe_n_data),
+                    ]
+                    self.sync += dq_o_data_d.eq(dq_o_data)
+                    dq_bl8_cases = {}
+                    dq_bl8_cases[0] = dq_o_data_muxed.eq(dq_o_data[:4])
+                    dq_bl8_cases[1] = dq_o_data_muxed.eq(dq_o_data_d[4:])
+                    self.sync += Case(bl8_chunk, dq_bl8_cases)
                 self.specials += [
-                    Instance("ODDRX2DQ",
+                    Instance(f"ODDRX{nphases}DQ",
                         i_RST     = ResetSignal("sys"),
                         i_SCLK    = ClockSignal("sys"),
-                        i_ECLK    = ClockSignal("sys2x"),
+                        i_ECLK    = ClockSignal(f"sys{nphases}x"),
                         i_DQSW270 = dqsw270,
-                        **{f"i_D{n}": dq_o_bitslip.o[n] for n in range(4)},
+                        **{f"i_D{n}": dq_o_bitslip.o[n] for n in range(2*nphases)},
                         o_Q       = dq_o
                     )
                 ]
-                dq_i_bitslip = BitSlip(4,
+                dq_i_bitslip = BitSlip(2*nphases,
                     rst    = self._dly_sel.storage[i] & self._rdly_dq_bitslip_rst.wr_stb,
                     slp    = self._dly_sel.storage[i] & self._rdly_dq_bitslip.wr_stb,
                     cycles = 1)
@@ -448,29 +488,33 @@ class NexusDDRPHY(Module, AutoCSR):
                         i_A            = dq_i,
                         o_Z            = dq_i_delayed
                     ),
-                    Instance("IDDRX2DQ",
+                    Instance(f"IDDRX{nphases}DQ",
                         i_RST     = ResetSignal("sys"),
                         i_SCLK    = ClockSignal("sys"),
-                        i_ECLK    = ClockSignal("sys2x"),
+                        i_ECLK    = ClockSignal(f"sys{nphases}x"),
                         i_DQSR90  = dqsr90,
                         **{f"i_RDPNTR{n}": rdpntr[n] for n in range(3)},
                         **{f"i_WRPNTR{n}": wrpntr[n] for n in range(3)},
                         i_D       = dq_i_delayed,
-                        **{f"o_Q{n}": dq_i_bitslip.i[n] for n in range(4)},
+                        **{f"o_Q{n}": dq_i_bitslip.i[n] for n in range(2*nphases)},
                     )
                 ]
-                dq_i_bitslip_o_d = Signal(4)
-                self.sync += dq_i_bitslip_o_d.eq(dq_i_bitslip.o)
-                self.comb += dq_i_data.eq(Cat(dq_i_bitslip_o_d, dq_i_bitslip.o))
-                for n in range(8):
-                    self.comb += dfi.phases[n//4].rddata[n%4*databits+j].eq(dq_i_data[n])
+                if nphases == 4:
+                    for n in range(8):
+                        self.comb += dfi.phases[n//2].rddata[n%2*databits+j].eq(dq_i_bitslip.o[n])
+                else:
+                    dq_i_bitslip_o_d = Signal(4)
+                    self.sync += dq_i_bitslip_o_d.eq(dq_i_bitslip.o)
+                    self.comb += dq_i_data.eq(Cat(dq_i_bitslip_o_d, dq_i_bitslip.o))
+                    for n in range(8):
+                        self.comb += dfi.phases[n//4].rddata[n%4*databits+j].eq(dq_i_data[n])
                 self.specials += [
-                    Instance("TSHX2DQ",
+                    Instance(f"TSHX{nphases}DQ",
                         i_RST     = ResetSignal("sys"),
                         i_SCLK    = ClockSignal("sys"),
-                        i_ECLK    = ClockSignal("sys2x"),
+                        i_ECLK    = ClockSignal(f"sys{nphases}x"),
                         i_DQSW270 = dqsw270,
-                        **{f"i_T{n}": dq_oe_n_bitslip.o[n] for n in range(2)},
+                        **{f"i_T{n}": dq_oe_n_bitslip.o[n] for n in range(nphases)},
                         o_Q       = dq_oe_n,
                     ),
                     Tristate(pads.dq[j], dq_o, ~dq_oe_n, dq_i)
@@ -495,7 +539,10 @@ class NexusDDRPHY(Module, AutoCSR):
         self.submodules += rddata_en
 
         self.comb += [phase.rddata_valid.eq(rddata_en.output) for phase in dfi.phases]
-        self.comb += dqs_re.eq(rddata_en.taps[rdtap] | rddata_en.taps[rdtap + 1])
+        if nphases == 4:
+            self.comb += dqs_re.eq(rddata_en.taps[rdtap])
+        else:
+            self.comb += dqs_re.eq(rddata_en.taps[rdtap] | rddata_en.taps[rdtap + 1])
 
         # Write Control Path -----------------------------------------------------------------------
         # The Nexus write path is one memory-clock late. Start one sys_clk cycle early and use the
@@ -513,13 +560,25 @@ class NexusDDRPHY(Module, AutoCSR):
         )
         self.submodules += wrdata_en
 
-        self.comb += dq_oe.eq(wrdata_en.taps[wrtap] | wrdata_en.taps[wrtap + 1])
-        self.comb += bl8_chunk.eq(wrdata_en.taps[wrtap])
-        self.comb += dqs_oe.eq(dq_oe)
+        if nphases == 4:
+            self.comb += dq_oe.eq(wrdata_en.taps[wrtap])
+            self.comb += dqs_oe.eq(dq_oe)
 
-        # Write DQS Postamble/Preamble Control Path ------------------------------------------------
-        # Generates DQS Preamble 1 cycle before the first write and Postamble 1 cycle after the last
-        # write. During writes, DQS tristate is configured as output for at least 4 sys_clk cycles:
-        # 1 for Preamble, 2 for the Write and 1 for the Postamble.
-        self.comb += dqs_preamble.eq( wrdata_en.taps[wrtap - 1]  & ~wrdata_en.taps[wrtap + 0])
-        self.comb += dqs_postamble.eq(wrdata_en.taps[wrtap + 2]  & ~wrdata_en.taps[wrtap + 1])
+            # Write DQS Postamble/Preamble Control Path ------------------------------------------------
+            # Generates DQS Preamble 1 cycle before the first write and Postamble 1 cycle after the last
+            # write. During writes, DQS tristate is configured as output for at least 3 sys_clk cycles:
+            # 1 for Preamble, 1 for the Write and 1 for the Postamble.
+            self.comb += dqs_preamble.eq( wrdata_en.taps[wrtap - 1]  & ~wrdata_en.taps[wrtap + 0])
+            self.comb += dqs_postamble.eq(wrdata_en.taps[wrtap + 1]  & ~wrdata_en.taps[wrtap + 0])
+
+        else:
+            self.comb += dq_oe.eq(wrdata_en.taps[wrtap] | wrdata_en.taps[wrtap + 1])
+            self.comb += bl8_chunk.eq(wrdata_en.taps[wrtap])
+            self.comb += dqs_oe.eq(dq_oe)
+
+            # Write DQS Postamble/Preamble Control Path ------------------------------------------------
+            # Generates DQS Preamble 1 cycle before the first write and Postamble 1 cycle after the last
+            # write. During writes, DQS tristate is configured as output for at least 4 sys_clk cycles:
+            # 1 for Preamble, 2 for the Write and 1 for the Postamble.
+            self.comb += dqs_preamble.eq( wrdata_en.taps[wrtap - 1]  & ~wrdata_en.taps[wrtap + 0])
+            self.comb += dqs_postamble.eq(wrdata_en.taps[wrtap + 2]  & ~wrdata_en.taps[wrtap + 1])
